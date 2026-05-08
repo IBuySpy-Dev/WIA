@@ -1,0 +1,124 @@
+name: Deploy WIA to App Service (S4)
+# Issue #624 — WIA direct App Service replatform
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: rg-migration-dev
+  AZURE_LOCATION: eastus2
+  BICEP_FILE: infra/app-service-legacy.bicep
+
+jobs:
+  deploy-infra:
+    name: Deploy Infrastructure (Bicep)
+    runs-on: ubuntu-latest
+    outputs:
+      app_service_url: ${{ steps.bicep.outputs.appServiceUrl }}
+      app_service_name: ${{ steps.bicep.outputs.appServiceName }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        id: bicep
+        run: |
+          out=$(az deployment group create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file "$BICEP_FILE" \
+            --parameters location="$AZURE_LOCATION" \
+            --query "properties.outputs" -o json)
+          echo "appServiceUrl=$(echo $out | jq -r '.appServiceUrl.value')" >> $GITHUB_OUTPUT
+          echo "appServiceName=$(echo $out | jq -r '.appServiceName.value')" >> $GITHUB_OUTPUT
+
+  deploy-app:
+    name: Deploy Application (Zip Deploy)
+    runs-on: ubuntu-latest
+    needs: deploy-infra
+    env:
+      APP_URL: ${{ needs.deploy-infra.outputs.app_service_url }}
+      APP_NAME: ${{ needs.deploy-infra.outputs.app_service_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Patch web.config for App Service compatibility
+        run: |
+          WC="Web.config"
+          # Windows auth is not supported without Easy Auth on App Service
+          # Switch to None (anonymous) for demo/dev environment
+          if grep -q 'mode="Windows"' "$WC"; then
+            sed -i 's/mode="Windows"/mode="None"/g' "$WC"
+            echo "Patched authentication: Windows -> None"
+          fi
+          # Remove deny-all authorization rule that blocks anonymous access
+          if grep -q '<deny users="?"' "$WC"; then
+            sed -i 's|<deny users="?" />||g' "$WC"
+            echo "Removed deny-anonymous authorization rule"
+          fi
+          # IIS integrated pipeline compatibility
+          if grep -q '<system.webServer>' "$WC"; then
+            if ! grep -q 'validateIntegratedModeConfiguration' "$WC"; then
+              sed -i 's|<system.webServer>|<system.webServer><validation validateIntegratedModeConfiguration="false" />|' "$WC"
+              echo "Patched validateIntegratedModeConfiguration"
+            fi
+          fi
+
+      - name: Zip application
+        run: |
+          zip -r app.zip . \
+            -x "*.sln" "*.vssscc" "*.vspscc" "*.csproj.user" "*.webinfo" \
+            -x "obj/*" "packages/*" "*.md" "infra/*" ".github/*" \
+            -x "app.zip"
+          echo "Created app.zip: $(du -sh app.zip | cut -f1)"
+
+      - name: Deploy zip to App Service
+        run: |
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$APP_NAME" \
+            --src-path app.zip \
+            --type zip \
+            --async false
+          echo "Deployed to $APP_URL"
+
+      - name: Smoke test - GET / expects HTTP 200
+        run: |
+          echo "Smoke testing: $APP_URL"
+          MAX=8
+          ATTEMPT=0
+          until [ "$ATTEMPT" -ge "$MAX" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            RESP_FILE=$(mktemp)
+            HTTP_STATUS=$(curl -s -L --max-time 30 -o "$RESP_FILE" -w "%{http_code}" "$APP_URL/" || echo "000")
+            echo "Attempt $ATTEMPT/$MAX - HTTP $HTTP_STATUS"
+            if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "302" ]; then
+              echo "--- Response (first 3000 chars) ---"
+              head -c 3000 "$RESP_FILE" 2>/dev/null || true
+              echo ""
+              echo "--- End response ---"
+            fi
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "302" ]; then
+              echo "Smoke test passed (HTTP $HTTP_STATUS)"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Smoke test failed after $MAX attempts"
+          exit 1
